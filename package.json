@@ -1,0 +1,14 @@
+{
+ "name": "claude-ai-vps",
+ "version": "1.6.0",
+ "private": true,
+ "type": "module",
+ "main": "app.mjs",
+ "engines": {
+  "node": ">=22"
+ },
+ "scripts": {
+  "start": "node app.mjs",
+  "keygen": "node scripts/keygen.mjs"
+ }
+}
