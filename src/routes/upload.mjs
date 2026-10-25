@@ -11,11 +11,12 @@ import { audit } from '../audit.mjs';
 import { confine } from '../paths.mjs';
 import { send } from '../http.mjs';
 
-export const handleUpload = async function (req, res, key, ip, url) {
+export const handleUpload = async function (req, res, key, ip, url, grant = null) {
  if (req.method !== 'PUT' && req.method !== 'POST') return send(res, 405, { error: 'method not allowed' }, { Allow: 'PUT, POST' });
- const rawPath = url.searchParams.get('path') || req.headers['x-target-path'];
+ // With a ticket the destination comes from the ticket; ?path=, x-target-path and the session are ignored.
+ const rawPath = grant ? grant.path : (url.searchParams.get('path') || req.headers['x-target-path']);
  if (typeof rawPath !== 'string' || !rawPath) return send(res, 400, { error: 'missing ?path= query parameter or x-target-path header' });
- const sid = url.searchParams.get('sessionId') || req.headers['x-session-id'];
+ const sid = grant ? null : (url.searchParams.get('sessionId') || req.headers['x-session-id']);
  const s = sess.touch(sid, key);
  if (sid && !s) return send(res, 404, { error: `session "${sid}" not found, expired or owned by another key` });
  let dest;
@@ -29,7 +30,7 @@ export const handleUpload = async function (req, res, key, ip, url) {
  if (append && prev && !prev.isFile()) return send(res, 400, { error: 'append target is not a regular file' });
  await mkdir(path.dirname(dest), { recursive: true });
  const rid = crypto.randomBytes(6).toString('hex');
- try { await audit.must({ key, ip, rid, upload: dest, declared, append }); } catch (e) { return send(res, 503, { error: e.message }); }
+ try { await audit.must({ key, ip, rid, upload: dest, declared, append, ...(grant && { tid: grant.tid }) }); } catch (e) { return send(res, 503, { error: e.message }); }
  const target = append ? dest : dest + '.upload-' + crypto.randomBytes(6).toString('hex');
  const hash = crypto.createHash('sha256');
  let bytes = 0, overflow = false, aborted = false;

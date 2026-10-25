@@ -7,11 +7,12 @@ import { sess } from '../sessions.mjs';
 import { audit } from '../audit.mjs';
 import { send } from '../http.mjs';
 
-export const handleDownload = async function (req, res, key, ip, url) {
+export const handleDownload = async function (req, res, key, ip, url, grant = null) {
  if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, { error: 'method not allowed' }, { Allow: 'GET, HEAD' });
- const rawPath = url.searchParams.get('path');
+ // With a ticket the absolute path comes from the ticket; query parameters and the session are ignored.
+ const rawPath = grant ? grant.path : url.searchParams.get('path');
  if (!rawPath) return send(res, 400, { error: 'missing ?path= query parameter' });
- const sid = url.searchParams.get('sessionId');
+ const sid = grant ? null : url.searchParams.get('sessionId');
  const s = sess.touch(sid, key);
  if (sid && !s) return send(res, 404, { error: `session "${sid}" not found, expired or owned by another key` });
  const src = path.resolve(s ? s.cwd : cfg.home, rawPath.replace(/^~(?=$|\/)/, cfg.home));
@@ -41,8 +42,8 @@ export const handleDownload = async function (req, res, key, ip, url) {
  try {
   // Bounded to the size announced in Content-Length even if the file grows meanwhile.
   await pipeline(fh.createReadStream({ start: 0, end: st.size - 1 }), res);
-  audit.log({ key, ip, download: src, bytes: st.size }).catch(() => { });
+  audit.log({ key, ip, download: src, bytes: st.size, ...(grant && { tid: grant.tid }) }).catch(() => { });
  } catch (e) {
-  audit.log({ key, ip, download: src, bytes: st.size, failed: e.message }).catch(() => { });
+  audit.log({ key, ip, download: src, bytes: st.size, failed: e.message, ...(grant && { tid: grant.tid }) }).catch(() => { });
  }
 };

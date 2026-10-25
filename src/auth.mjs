@@ -16,6 +16,11 @@ export const auth = {
   const m = String(req.headers.authorization || '').match(/^Bearer\s+([A-Za-z0-9_-]{20,128})$/);
   return m ? m[1] : null;
  },
+ apiKey: function (req) {
+  const v = req.headers['x-api-key'];
+  const m = typeof v === 'string' && v.match(/^[A-Za-z0-9_-]{20,128}$/);
+  return m ? m[0] : null;
+ },
  blocked: function (ip) {
   const f = fails.get(ip);
   if (!f) return false;

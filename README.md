@@ -11,7 +11,7 @@ Minimal MCP server that hands a **shell and file access on a Linux VPS** to a mo
 Design choices that follow from that:
 
 - **Stateless HTTP, JSON only.** Request/response. No SSE stream, no `Mcp-Session-Id`, no server memory between HTTP calls. Sessions are an application-level concept (`sessionId`), not MCP transport sessions.
-- **No OAuth.** One shared secret per operator, sent in the URL or as `Authorization: Bearer`.
+- **No OAuth.** One shared secret per operator, sent in the URL path (`/mcp/<key>`, which is what claude.ai needs), as `Authorization: Bearer <key>` or as `X-API-Key: <key>`.
 - **Tiny dependency surface.** Zero runtime dependencies, Node.js ≥ 22 only.
 - **Raw `bash` behind `exec`.** The shell is the product, not an API wrapper around `ls` and `cat`. Everything else (`read_file`, `write_file`, …) exists only to save the model round trips and to give it syntax checks before it edits a file.
 
@@ -27,17 +27,23 @@ Design choices that follow from that:
 | `write_file` | Creates/overwrites a file (atomic temp+rename), creates parent dirs, reports a `syntax` field (`node --check` for JS, `JSON.parse` for JSON). |
 | `edit_fragment` | Replaces one **unique** fragment; 0 or multiple matches are rejected. Syntax checked **before** writing: nothing is saved on a syntax error. |
 | `multi_edit` | Several replacements in one file, applied in order, written only if all apply and the result passes the syntax check. |
-| `upload_instruction` | Returns a ready `curl` for `PUT /upload/<key>` — streams a local file straight to the VPS. |
-| `download_instruction` | Returns a ready `curl` for `GET /download/<key>` plus the SHA-256 of the file. |
+| `upload_instruction` | Returns a ready `curl` with a **single-use ticket URL** (`PUT /upload/t/<ticket>`, no API key inside) — streams a local file straight to the VPS. |
+| `download_instruction` | Returns a ready `curl` with a **single-use ticket URL** (`GET /download/t/<ticket>`, no API key inside) plus the SHA-256 of the file. Directories are not served: pack them first with `exec` (`tar -czf`). |
 
-HTTP endpoints (all key-authenticated, key in the path or as Bearer):
+HTTP endpoints:
 
 ```text
-POST   /mcp/<key>        JSON-RPC 2.0 (initialize, ping, tools/list, tools/call)
-PUT    /upload/<key>     ?path=/abs/target  (+ &append=1), body streamed to disk
-GET    /download/<key>   ?path=/abs/source, streamed, SHA-256 printed by the instruction tool
-GET    /health           {"ok":true}, no key
+POST   /mcp/<key>             JSON-RPC 2.0 (initialize, ping, tools/list, tools/call)
+PUT    /upload/t/<ticket>     body streamed to disk; path comes from the ticket (+ ?append=1)
+GET    /download/t/<ticket>   streamed binary; path comes from the ticket (HEAD does not consume it)
+PUT    /upload/<key>          ?path=/abs/target (+ &append=1)   — key auth, for manual use
+GET    /download/<key>        ?path=/abs/source                 — key auth, for manual use
+GET    /health                {"ok":true}, no key
 ```
+
+The key can also be sent as `Authorization: Bearer <key>` or `X-API-Key: <key>` instead of in the path (`/mcp`, `/upload`, `/download`). Keep it out of URLs whenever you drive the server by hand.
+
+**Transfer tickets.** The `*_instruction` tools never put the API key into the URL they hand to the model. They issue a ticket instead: 192 bits of randomness, valid for `TICKET_TTL` seconds (default 600), bound to one operation (upload *or* download), one owner and one absolute path, and consumed by the first `GET`/`PUT` (a `HEAD` and a wrong-method request do not consume it). With a ticket, `?path=`, `sessionId` and `x-target-path` are ignored, so a leaked link cannot be pointed at another file. Tickets live in memory only: a restart invalidates all of them, and at most 500 can be pending. Ask the tool again if a transfer fails; an `append` upload in several chunks needs a fresh ticket per chunk.
 
 ## Install, step by step
 
@@ -133,19 +139,20 @@ curl -s -X POST https://rsh.example.com/mcp/<key> -H 'content-type: application/
 3. Leave the OAuth fields empty; this server has no OAuth. Add the connector, then enable it in a conversation (the tools icon) so the model can call `session_open`, `exec`, etc.
 4. Ask something verifiable first: *"Use claude-ai-vps: open a session and run `hostname; df -h /`"*.
 
-The connector URL is the secret. `?key=<key>` works as an alternative to `/mcp/<key>` if a client mangles path segments.
+The connector URL is the secret: it is the one place where the key has to be in the URL, because claude.ai cannot send custom headers to a custom connector.
 
 ## Environment variables
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `CLAUDE_AI_VPS_KEYS` | *(empty)* | Comma-separated `label:sha256hex` stubs, **no spaces**. Generate with `npm run keygen`. Empty = every request is rejected (404). |
-| `PUBLIC_URL` | *(empty)* | Public base URL (`https://rsh.example.com`). Used by `upload_instruction`/`download_instruction` to build the URLs the model should curl. If unset the handlers emit the bind address, which a remote client usually cannot reach. |
+| `PUBLIC_URL` | *(empty)* | Public base URL (`https://rsh.example.com`). Used by `upload_instruction`/`download_instruction` to build the ticket URLs the model should curl. If unset the handlers emit the bind address, which a remote client usually cannot reach. |
 | `SHELL_HOME` | `os.homedir()` | The directory the shell starts in, `~` expands to, and the first writable root. Point it at the user you want the model to act as. |
 | `WRITE_ROOTS` | *(empty)* | Extra comma-separated directories that `write_file`/`edit_fragment`/`multi_edit`/`/upload` may write to, on top of `SHELL_HOME`. Relative paths are resolved against the server cwd. `exec` ignores this list (see Security). |
 | `AUDIT_LOG` | `./audit.log` | JSON-lines audit file. Mutations are logged **before** they happen; if it cannot be appended to, the mutation is refused. |
 | `MAX_UPLOAD` | `524288000` (500 MB) | Max size of a single `/upload` body, enforced while streaming. `0`/garbage falls back to the default. |
 | `MAX_DOWNLOAD` | `524288000` (500 MB) | Max size of a file served by `/download` (checked before streaming). |
+| `TICKET_TTL` | `600` | Lifetime in seconds of an upload/download ticket. `0`/garbage falls back to the default. |
 | `PORT` | `49995` | Listen port. |
 | `HOST` | `127.0.0.1` | Bind address. Keep it loopback and let the proxy expose it; `0.0.0.0` puts the raw HTTP server on the internet. |
 
@@ -158,9 +165,9 @@ Read this before pointing the server at a public URL. Short version: **the only 
 - **`exec` is a full shell.** It runs `bash -c` as the server user with no sandbox, no allow-list, no argument filtering. Anything that user can do, the model can do — including `cat ~/.ssh/id_ed25519`, `systemctl`, `curl | bash`, and killing the server. `WRITE_ROOTS` is not consulted by `exec`.
 - **Path confinement is not a security boundary.** `WRITE_ROOTS`/`SHELL_HOME` limits apply to `write_file`, `edit_fragment`, `multi_edit` and `/upload`. They exist to stop the model writing into the wrong place by accident (system configs, other projects, `/etc`), not to stop an attacker: one `exec` call bypasses them completely. Read access is likewise unrestricted. Treat write confinement as a guardrail against model mistakes.
 - **Symlinks are resolved best-effort.** Before a confined write, the deepest existing ancestor of the target is `realpath`-ed and the result must stay inside a root; symlinked parents, `..` in the path, dangling links and a write to `/` or to the home directory itself are rejected. Between that check and the actual write there is a window: a process that can create symlinks inside a root can win the race (**TOCTOU**). Non-atomic only in the sense that the path is re-resolved by the kernel at write time; the write itself is atomic (temp file + rename). `append` uploads are written in place.
-- **Audit is fail-closed, with exceptions.** Every mutation (`exec` command, `write_file`, `edit_fragment`, `multi_edit`, `/upload`) is appended to `AUDIT_LOG` *before* it runs; if the log cannot be written the operation is refused with `refused, nothing changed`. Reads, downloads and the `*_instruction` tools only log *after* the fact and their failures are swallowed — if you need "nothing leaves the box without a log line", you must narrow this yourself. The log is plain text on disk: rotate it, and keep it out of anything the shell tools can read if the model is not trusted.
-- **The key in the URL is the secret.** `/mcp/<key>`, `/upload/<key>` and `/download/<key>` embed the key; a `curl` line returned to the model therefore contains it, and so may appear in chat history, transcripts, screenshots or `~/.bash_history`. URLs leak through proxy access logs, browser history and `Referer` on any page that links them. If a key leaks, remove its stub from `CLAUDE_AI_VPS_KEYS` and restart — that is the whole revocation story (no per-key state, no expiry).
-- **No OAuth, no `Mcp-Session-Id`.** There is no token endpoint, no refresh, no consent screen, no client registration, and no transport session to hijack. One static secret, `timingSafeEqual` comparison over SHA-256 hashes, unknown key ⇒ `404` (not `401`), 20 failures per IP per 10 min ⇒ `429`. Over plain HTTP the key travels in clear text — HTTPS is mandatory.
+- **Audit is fail-closed, with exceptions.** Every mutation (`exec` command, `write_file`, `edit_fragment`, `multi_edit`, `/upload`) is appended to `AUDIT_LOG` *before* it runs; if the log cannot be written the operation is refused with `refused, nothing changed`. Reads, downloads (including ticketed ones) and ticket issuance only log *after* the fact and their failures are swallowed — if you need "nothing leaves the box without a log line", you must narrow this yourself. The log is plain text on disk: rotate it, and keep it out of anything the shell tools can read if the model is not trusted.
+- **The key is the secret, and `/mcp/<key>` has to carry it.** The connector URL embeds the key, so it can show up in claude.ai settings, proxy access logs, browser history and anything that stores the URL. The transfer links are different: `upload_instruction`/`download_instruction` return single-use ticket URLs, so the `curl` line that lands in chat history, transcripts, screenshots or `~/.bash_history` does not contain the key. A ticket still grants one read or one write of one path to whoever holds it until it is used or expires (10 min by default), and it is visible in proxy access logs like any URL, but it is dead after first use. The older `/upload/<key>` and `/download/<key>` forms still exist for manual use; prefer `Authorization: Bearer` or `X-API-Key` there so the key stays out of the URL. If a key leaks, remove its stub from `CLAUDE_AI_VPS_KEYS` and restart — that is the whole revocation story (no per-key state, no expiry). The restart also drops all sessions and tickets.
+- **No OAuth, no `Mcp-Session-Id`.** There is no token endpoint, no refresh, no consent screen, no client registration, and no transport session to hijack. One static secret, `timingSafeEqual` comparison over SHA-256 hashes, unknown key ⇒ `404` (not `401`), 20 failures per IP per 10 min ⇒ `429`. Over plain HTTP the key (and any ticket) travels in clear text — HTTPS is mandatory.
 - **Processes survive a timeout.** `exec` runs the command in its own process group. On timeout the group is `SIGKILL`ed (exit code `124`) and output is still returned, but the kill cannot reach grandchildren that left the group — `setsid`, a daemon, `pm2`-daemonized children, `nohup` — or a process stuck in uninterruptible I/O. Anything like that keeps running after the call returns. `cd` survives only because the cwd is recovered from a marker line; exported variables and shell state do not.
 
 What to do instead of trusting this: run the server as a dedicated unprivileged user, in a container/VM or with `systemd` hardening (`ProtectSystem=strict`, `ProtectHome=read-only` or separate user homes, `NoNewPrivileges`, `PrivateTmp`, restrictive `ReadWritePaths`), bind loopback, front everything with HTTPS, and treat any key you hand to a chat session as a credential that can do whatever that user can do.
@@ -177,6 +184,14 @@ One JSON object per line:
 
 `key` is the label, never the key or its hash. `rid` ties the pre-execution record to its result.
 
+Transfers carry a `tid` (the first 12 hex characters of the ticket's SHA-256) that links the record of issuing a ticket to the record of using it; the ticket itself is never logged:
+
+```json
+{"ts":"…","key":"key-rsxe","ip":"127.0.0.1","sid":"AbC…","issued":"upload","path":"/home/deploy/app/data.bin","tid":"3f9a1c0b7d42"}
+{"ts":"…","key":"key-rsxe","ip":"203.0.113.7","rid":"c41e0a","upload":"/home/deploy/app/data.bin","declared":3000,"append":false,"tid":"3f9a1c0b7d42"}
+{"ts":"…","key":"key-rsxe","ip":"203.0.113.7","download":"/home/deploy/app/out.tgz","bytes":17103,"tid":"8b02e6d1a9f5"}
+```
+
 ## Troubleshooting
 
 | Symptom | Cause |
@@ -184,7 +199,8 @@ One JSON object per line:
 | claude.ai says the connector failed | URL is not public HTTPS, missing `/mcp/<key>`, or the proxy strips the path. `curl /health` and `curl -X POST …/mcp/<key>` from outside first. |
 | Everything returns `404` | `CLAUDE_AI_VPS_KEYS` empty, key hash wrong, or label has a space/`:` (the stub gets split incorrectly). Check the startup log line with the key count. |
 | `429 too many requests` | 20 failed auth attempts from that IP within 10 min. Fix the key or restart the server. |
-| `upload_instruction` returns an unreachable URL | `PUBLIC_URL` unset. |
+| `upload_instruction`/`download_instruction` return an unreachable URL | `PUBLIC_URL` unset. |
+| A ticket URL returns `404` | Expired (`TICKET_TTL`), already used, issued for the other operation (an upload ticket does not work on `/download`), or the server restarted since it was issued (tickets are in memory). Call the instruction tool again. |
 | `path is outside the writable roots` | `WRITE_ROOTS`/`SHELL_HOME` do not cover the target, or a symlinked parent resolves elsewhere. Use `exec` (deliberately) or extend the roots. |
 | `refused, nothing changed: audit log unavailable` | `AUDIT_LOG` path is not writable by the server user. |
 | `bash not found on PATH` | No `bash` on the box (`exec` requires it; Alpine needs `apk add bash`). |
@@ -197,7 +213,8 @@ app.mjs                  http server + startup warnings
 scripts/keygen.mjs       key generator (prefix + random suffix, sha256 stub)
 src/config.mjs           env parsing, limits, protocol versions
 src/router.mjs           URL routing, auth, JSON-RPC dispatch
-src/auth.mjs             key check, per-IP fail counter
+src/auth.mjs             key check (path, Bearer, X-API-Key), per-IP fail counter
+src/tickets.mjs          single-use transfer tickets (in memory, sha256-keyed)
 src/paths.mjs            write confinement (realpath, best effort)
 src/audit.mjs            fail-closed audit log
 src/sessions.mjs         sessionId → cwd, bound to the owning key

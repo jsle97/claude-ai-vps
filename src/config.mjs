@@ -25,6 +25,7 @@ export const cfg = {
  maxBody: 4 * 1024 * 1024,
  maxUpload: envInt('MAX_UPLOAD', 500 * 1024 * 1024),
  maxDownload: envInt('MAX_DOWNLOAD', 500 * 1024 * 1024),
+ ticketTtl: envInt('TICKET_TTL', 600),
  maxOut: 64 * 1024,
  maxRead: 256 * 1024,
  maxReadLines: 2000,
